@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Probe video metadata and extract frames at an auto-scaled fps.
+"""Probe video metadata and extract frames with content-aware sampling.
 
-Auto-fps targets a frame budget, not a fixed rate. Token cost scales with frame
-count, so budget-by-duration keeps short videos dense and long videos capped.
-When a user-specified range is passed, focused-mode budgets denser (they are
-zooming in for detail).
+Default mode is scene-aware: keep a frame on a scene change OR after a minimum
+gap ("temporal floor") since the last kept frame. A duration -> (max_frames,
+temporal_floor) table caps total output and guarantees coverage on static
+content. A uniform-fps path is available by using the --fps parameter.
 """
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,15 @@ from pathlib import Path
 
 
 MAX_FPS = 2.0
+
+# Scene-detect threshold for ffmpeg's `scene` metric. 0.3 = sensitive (catches
+# subtle changes), 0.4 = conservative (only obvious cuts). 0.35 is the
+# literature default; revisit if validation surfaces an obvious miscalibration.
+# Could be exposed as a CLI flag to allow the skill making adjustments.
+SCENE_THRESHOLD = 0.35
+
+# stderr line from ffmpeg's `showinfo` filter; one per emitted frame.
+_SHOWINFO_PTS_RE = re.compile(r"Parsed_showinfo.*?\bpts_time:(\d+(?:\.\d+)?)")
 
 
 def _clamp_fps(fps: float, duration_seconds: float, max_frames: int) -> tuple[float, int]:
@@ -131,15 +141,82 @@ def auto_fps_focus(duration_seconds: float, max_frames: int = 100) -> tuple[floa
     return _clamp_fps(target / duration_seconds, duration_seconds, max_frames)
 
 
+def scene_budget(duration_seconds: float) -> tuple[int, float]:
+    """Full-mode scene-aware budget: (max_frames_ceiling, temporal_floor_seconds).
+
+    Used when ffmpeg picks frames via scene-detect OR temporal-floor (scene mode).
+    The max_frames ceiling protects token budget; the temporal-floor guarantees
+    coverage on static content where no scene cuts fire.
+    """
+    if duration_seconds <= 30:
+        return (30, 1.0)
+    if duration_seconds <= 60:
+        return (40, 2.0)
+    if duration_seconds <= 180:  # 3 min
+        return (60, 3.0)
+    if duration_seconds <= 600:  # 10 min
+        return (80, 8.0)
+    if duration_seconds <= 1800:  # 30 min
+        return (100, 30.0)
+    if duration_seconds <= 3600:  # 1 hr
+        return (120, 60.0)
+    if duration_seconds <= 7200:  # 2 hr
+        return (150, 90.0)
+    return (180, 120.0)
+
+
+def scene_budget_focus(duration_seconds: float) -> tuple[int, float]:
+    """Focus-mode scene-aware budget: denser temporal-floor than full mode.
+
+    Once the user has zoomed in via --start/--end they want every meaningful
+    frame, so the minimum gap between kept frames is tighter at every band.
+    """
+    if duration_seconds <= 5:
+        return (30, 0.5)
+    if duration_seconds <= 15:
+        return (60, 1.0)
+    if duration_seconds <= 30:
+        return (60, 2.0)
+    if duration_seconds <= 60:
+        return (80, 3.0)
+    if duration_seconds <= 180:
+        return (100, 5.0)
+    return (100, 10.0)
+
+
+def _parse_pts_from_stderr(stderr: str) -> list[float]:
+    """Pull pts_time values from ffmpeg's showinfo filter output (one per emitted frame)."""
+    return [float(m.group(1)) for m in _SHOWINFO_PTS_RE.finditer(stderr)]
+
+
 def extract(
     video_path: str,
     out_dir: Path,
-    fps: float,
+    *,
+    mode: str = "scene",
+    fps: float | None = None,
+    scene_threshold: float = SCENE_THRESHOLD,
+    temporal_floor: float = 30.0,
     resolution: int = 512,
     max_frames: int = 100,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
 ) -> list[dict]:
+    """Extract frames either scene-aware (default) or at uniform fps (legacy --fps).
+
+    Scene mode: ffmpeg's `select` keeps frames on scene-change OR after a
+    temporal-floor gap; first frame is always included.
+    Uniform mode: legacy `fps={fps}` filter, identical to pre-3a behavior.
+
+    In both modes, `showinfo` emits per-frame pts to stderr; timestamps come
+    from those values instead of i/fps math (which is wrong as soon as frames
+    are non-uniformly spaced, and even drifts on uniform sampling).
+    """
+    if mode not in ("scene", "uniform"):
+        raise ValueError(f"extract() mode must be 'scene' or 'uniform', got {mode!r}")
+    if mode == "uniform" and (fps is None or fps <= 0):
+        raise ValueError("extract() mode='uniform' requires a positive fps")
+
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
 
@@ -151,7 +228,9 @@ def extract(
     cmd: list[str] = [
         "ffmpeg",
         "-hide_banner",
-        "-loglevel", "error",
+        # `info` (not `error`) so showinfo lines reach stderr. We parse them and
+        # discard the surrounding muxer/codec noise.
+        "-loglevel", "info",
         "-y",
     ]
 
@@ -161,9 +240,27 @@ def extract(
     if end_seconds is not None:
         cmd += ["-to", f"{end_seconds:.3f}"]
 
+    if mode == "scene":
+        # `+` = logical OR in ffmpeg's select expression. Commas inside gt()/gte()
+        # are escaped so they aren't parsed as filter-chain separators. eq(n,0)
+        # guarantees the very first frame is kept (scene metric for frame 0 is 0).
+        select_expr = (
+            f"gt(scene\\,{scene_threshold})"
+            f"+gte(t-prev_selected_t\\,{temporal_floor})"
+            f"+eq(n\\,0)"
+        )
+        vf = f"select={select_expr},showinfo,scale={resolution}:-2"
+    else:
+        vf = f"fps={fps},showinfo,scale={resolution}:-2"
+
     cmd += [
         "-i", str(Path(video_path).resolve()),
-        "-vf", f"fps={fps},scale={resolution}:-2",
+        "-vf", vf,
+        # Without -fps_mode vfr, ffmpeg's image2 muxer pads sparse `select` output
+        # by writing the previous frame repeatedly to match a target framerate,
+        # producing many duplicate JPEGs. vfr passes each filtered frame through
+        # with its real PTS, one file per frame.
+        "-fps_mode", "vfr",
         "-frames:v", str(max_frames),
         "-q:v", "4",
         output_pattern,
@@ -171,18 +268,27 @@ def extract(
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise SystemExit(f"ffmpeg frame extraction failed: {result.stderr.strip()}")
+        # stderr now contains info-level noise too; surface the tail so the
+        # actual error isn't drowned out.
+        tail = "\n".join(result.stderr.strip().splitlines()[-10:])
+        raise SystemExit(f"ffmpeg frame extraction failed:\n{tail}")
 
     offset = start_seconds or 0.0
     frames = sorted(out_dir.glob("frame_*.jpg"))
-    return [
-        {
-            "index": i,
-            "timestamp_seconds": round(offset + (i / fps if fps > 0 else 0.0), 2),
-            "path": str(p),
-        }
-        for i, p in enumerate(frames)
-    ]
+    pts_values = _parse_pts_from_stderr(result.stderr)
+
+    out: list[dict] = []
+    for i, p in enumerate(frames):
+        if i < len(pts_values):
+            t = offset + pts_values[i]
+        elif mode == "uniform" and fps:
+            # Fallback for the unlikely case showinfo didn't emit for every frame.
+            t = offset + (i / fps)
+        else:
+            # Scene mode + missing pts: best-effort, mark as offset only.
+            t = offset
+        out.append({"index": i, "timestamp_seconds": round(t, 2), "path": str(p)})
+    return out
 
 
 if __name__ == "__main__":
@@ -200,7 +306,7 @@ if __name__ == "__main__":
 
     fps_override = None
     resolution = 512
-    max_frames = 100
+    max_frames_cli = None  # None = take from scene_budget table
     start_arg = None
     end_arg = None
     i = 0
@@ -210,7 +316,7 @@ if __name__ == "__main__":
         elif args[i] == "--resolution":
             resolution = int(args[i + 1]); i += 2
         elif args[i] == "--max-frames":
-            max_frames = int(args[i + 1]); i += 2
+            max_frames_cli = int(args[i + 1]); i += 2
         elif args[i] == "--start":
             start_arg = args[i + 1]; i += 2
         elif args[i] == "--end":
@@ -228,23 +334,56 @@ if __name__ == "__main__":
     effective_duration = max(0.0, effective_end - effective_start)
 
     focused = start_sec is not None or end_sec is not None
-    if focused:
-        fps, target = auto_fps_focus(effective_duration, max_frames=max_frames)
-    else:
-        fps, target = auto_fps(effective_duration, max_frames=max_frames)
+
     if fps_override is not None:
-        fps = fps_override
+        # Legacy uniform-sampling escape hatch.
+        mode = "uniform"
+        fps = min(fps_override, MAX_FPS)
+        # max_frames: keep prior default of 100 when user didn't supply one.
+        max_frames = max_frames_cli if max_frames_cli is not None else 100
         target = max(1, int(round(fps * effective_duration)))
+        scene_threshold_used: float | None = None
+        temporal_floor_used: float | None = None
+    else:
+        mode = "scene"
+        fps = None
+        if focused:
+            table_max, temporal_floor_used = scene_budget_focus(effective_duration)
+        else:
+            table_max, temporal_floor_used = scene_budget(effective_duration)
+        # User --max-frames is an explicit cap; otherwise use the table.
+        max_frames = min(max_frames_cli, table_max) if max_frames_cli is not None else table_max
+        scene_threshold_used = SCENE_THRESHOLD
+        target = None  # actual count only known after extraction
 
     frames = extract(
         video, out,
+        mode=mode,
         fps=fps,
+        scene_threshold=scene_threshold_used or SCENE_THRESHOLD,
+        temporal_floor=temporal_floor_used or 30.0,
         resolution=resolution,
         max_frames=max_frames,
         start_seconds=start_sec,
         end_seconds=end_sec,
     )
+
+    if target is None:
+        target = len(frames)
+
     print(json.dumps(
-        {"meta": meta, "fps": fps, "target": target, "focused": focused, "frames": frames},
+        {
+            "meta": meta,
+            "fps": fps,
+            "target": target,
+            "focused": focused,
+            "sampling": {
+                "mode": mode,
+                "scene_threshold": scene_threshold_used,
+                "temporal_floor_seconds": temporal_floor_used,
+                "max_frames": max_frames,
+            },
+            "frames": frames,
+        },
         indent=2,
     ))
