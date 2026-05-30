@@ -16,7 +16,16 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from download import download, is_url  # noqa: E402
-from frames import MAX_FPS, auto_fps, auto_fps_focus, extract, format_time, get_metadata, parse_time  # noqa: E402
+from frames import (  # noqa: E402
+    MAX_FPS,
+    SCENE_THRESHOLD,
+    extract,
+    format_time,
+    get_metadata,
+    parse_time,
+    scene_budget,
+    scene_budget_focus,
+)
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 
@@ -38,9 +47,19 @@ def main() -> int:
         description="Download a video, extract auto-scaled frames, and surface the transcript.",
     )
     ap.add_argument("source", help="Video URL or local file path")
-    ap.add_argument("--max-frames", type=int, default=80, help="Cap on frame count (default 80, hard max 100)")
+    ap.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="Cap on frame count (default: per-duration table, up to 180 on >2hr videos)",
+    )
     ap.add_argument("--resolution", type=int, default=512, help="Frame width in pixels (default 512)")
-    ap.add_argument("--fps", type=float, default=None, help="Override auto-fps")
+    ap.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Escape hatch to legacy uniform sampling (clamped to 2 fps). Disables scene-aware mode.",
+    )
     ap.add_argument("--start", type=str, default=None, help="Range start (SS, MM:SS, or HH:MM:SS)")
     ap.add_argument("--end", type=str, default=None, help="Range end (SS, MM:SS, or HH:MM:SS)")
     ap.add_argument("--out-dir", type=str, default=None, help="Working directory (default: tmp)")
@@ -61,8 +80,6 @@ def main() -> int:
         help="Force a specific Whisper backend. Default: prefer Groq, fall back to OpenAI.",
     )
     args = ap.parse_args()
-
-    max_frames = min(args.max_frames, 100)
 
     if args.out_dir:
         work = Path(args.out_dir).expanduser().resolve()
@@ -97,29 +114,55 @@ def main() -> int:
     focused = start_sec is not None or end_sec is not None
 
     if args.no_frames:
-        fps = 0.0
-        target = 0
+        sampling_mode = "none"
+        fps: float | None = None
+        temporal_floor: float | None = None
+        target: int | None = 0
+        max_frames = 0
         frames: list[dict] = []
         print("[watch] --no-frames set — skipping frame extraction", file=sys.stderr)
     else:
-        if focused:
-            fps, target = auto_fps_focus(effective_duration, max_frames=max_frames)
-        else:
-            fps, target = auto_fps(effective_duration, max_frames=max_frames)
         if args.fps is not None:
+            # Legacy uniform-sampling escape hatch (backward compat with --fps).
+            sampling_mode = "uniform"
             fps = min(args.fps, MAX_FPS)
+            max_frames = args.max_frames if args.max_frames is not None else 80
             target = max(1, int(round(fps * effective_duration)))
+            temporal_floor = None
+        else:
+            sampling_mode = "scene"
+            fps = None
+            if focused:
+                table_max, temporal_floor = scene_budget_focus(effective_duration)
+            else:
+                table_max, temporal_floor = scene_budget(effective_duration)
+            # User --max-frames is an explicit cap; otherwise use the per-duration table.
+            max_frames = min(args.max_frames, table_max) if args.max_frames is not None else table_max
+            target = None  # actual count only known after extraction
 
         scope = (
             f"{format_time(effective_start)}-{format_time(effective_end)} ({effective_duration:.1f}s)"
             if focused else f"full {effective_duration:.1f}s"
         )
-        print(f"[watch] extracting ~{target} frames at {fps:.3f} fps over {scope}…", file=sys.stderr)
+        if sampling_mode == "scene":
+            print(
+                f"[watch] extracting up to {max_frames} frames "
+                f"(scene-aware, min {temporal_floor:.0f}s gap) over {scope}…",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[watch] extracting ~{target} frames at {fps:.3f} fps (uniform) over {scope}…",
+                file=sys.stderr,
+            )
 
         frames = extract(
             video_path,
             work / "frames",
+            mode=sampling_mode,
             fps=fps,
+            scene_threshold=SCENE_THRESHOLD,
+            temporal_floor=temporal_floor if temporal_floor is not None else 30.0,
             resolution=args.resolution,
             max_frames=max_frames,
             start_seconds=start_sec,
@@ -186,8 +229,17 @@ def main() -> int:
     if args.no_frames:
         print("- **Frames:** skipped (`--no-frames`)")
     else:
-        mode = "focused" if focused else "full"
-        print(f"- **Frames:** {len(frames)} @ {fps:.3f} fps, {mode} mode (budget {target}, max {max_frames})")
+        scope_mode = "focused" if focused else "full"
+        if sampling_mode == "scene":
+            print(
+                f"- **Frames:** {len(frames)} / {max_frames} max — "
+                f"scene-aware sampling (min {temporal_floor:.0f}s between frames), {scope_mode} mode"
+            )
+        else:
+            print(
+                f"- **Frames:** {len(frames)} @ {fps:.3f} fps — "
+                f"uniform sampling (--fps override), {scope_mode} mode"
+            )
         print(f"- **Frame size:** {args.resolution}px wide")
     if transcript_segments:
         in_range = " in range" if focused else ""

@@ -56,13 +56,21 @@ Within a single session, you can skip Step 0 on follow-up `/watch` calls — onc
 
 ## Recommended limits
 
-- **Best accuracy: videos under 10 minutes.** Frame coverage scales inversely with duration.
-- **Hard caps: 100 frames total and 2 fps.** Token cost grows with frame count, so the script targets a frame budget by duration (and never exceeds 2 fps even when the budget would imply more):
-  - ≤30s → ~1-2 fps (up to 30 frames)
-  - 30s-1min → ~40 frames
-  - 1-3min → ~60 frames
-  - 3-10min → ~80 frames
-  - \>10min → 100 frames, sparsely spaced (warning printed)
+- **Best accuracy: videos under 10 minutes.** Frame coverage scales inversely with duration, even with scene-aware sampling.
+- **Sampling is content-aware by default.** Frames are kept on scene changes (cuts, big visual changes) and at a minimum cadence regardless ("temporal floor"), so static talking-head video still gets even coverage and fast-cut trailers don't miss cuts. The script targets a per-duration max-frames ceiling with a matching minimum gap between frames:
+
+  | Duration | Max frames | Min gap between frames |
+  |---|---|---|
+  | ≤ 30 s | 30 | 1 s |
+  | 30 s – 1 min | 40 | 2 s |
+  | 1 – 3 min | 60 | 3 s |
+  | 3 – 10 min | 80 | 8 s |
+  | 10 – 30 min | 100 | 30 s |
+  | 30 – 60 min | 120 | 60 s |
+  | 1 – 2 hr | 150 | 90 s |
+  | > 2 hr | 180 | 120 s |
+
+- The `--fps F` flag is an escape hatch to the legacy uniform-sampling code path (still clamped to 2 fps). Use it only when you specifically need evenly-spaced frames.
 - If the user hands you a long video, consider asking whether they want a specific section before burning tokens on a sparse scan.
 
 ## How to invoke
@@ -76,24 +84,27 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/watch.py" "<source>"
 ```
 
 Optional flags:
-- `--start T` / `--end T` — focus on a section. Accepts `SS`, `MM:SS`, or `HH:MM:SS`. When either is set, fps auto-scales denser (see "Focusing on a section" below).
-- `--max-frames N` — lower the cap for tighter token budget (e.g. `--max-frames 40`)
+- `--start T` / `--end T` — focus on a section. Accepts `SS`, `MM:SS`, or `HH:MM:SS`. When either is set, sampling is denser and the minimum gap shrinks (see "Focusing on a section" below).
+- `--max-frames N` — lower the cap for tighter token budget (e.g. `--max-frames 40`). Defaults to the per-duration table above.
 - `--resolution W` — change frame width in px (default 512; bump to 1024 only if the user needs to read on-screen text)
-- `--fps F` — override auto-fps (clamped to 2 fps max)
+- `--fps F` — enforce uniform sampling (clamped to 2 fps). Disables scene-aware mode.
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
 - `--whisper groq|openai` — force a specific Whisper backend (default: prefer Groq if both keys exist)
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
 - `--no-frames` — skip frame extraction entirely. Use for audio-only content (podcasts, interviews, lectures) where frames waste tokens. Transcript-only output.
 
-### Focusing on a section (higher frame rate)
+### Focusing on a section (denser sampling)
 
-When the user asks about a specific moment — "what happens at the 2 minute mark?", "zoom into 0:45 to 1:00", "the first 10 seconds" — pass `--start` and/or `--end`. The script switches to focused-mode budgets, which are denser than full-video budgets (still capped at 2 fps):
+When the user asks about a specific moment — "what happens at the 2 minute mark?", "zoom into 0:45 to 1:00", "the first 10 seconds" — pass `--start` and/or `--end`. The script switches to focused-mode budgets, which are denser than full-video budgets (still capped at 2 fps and max. 100 frames):
 
-- ≤5s → 2 fps (up to 10 frames)
-- 5-15s → 2 fps (up to 30 frames)
-- 15-30s → ~2 fps (up to 60 frames)
-- 30-60s → ~1.3 fps (up to 80 frames)
-- 60-180s → ~0.6 fps (100 frames, capped)
+| Range duration | Max frames | Min gap between frames |
+|---|---|---|
+| ≤ 5 s | 30 | 0.5 s |
+| 5 – 15 s | 60 | 1 s |
+| 15 – 30 s | 60 | 2 s |
+| 30 – 60 s | 80 | 3 s |
+| 1 – 3 min | 100 | 5 s |
+| > 3 min | 100 | 10 s |
 
 Focused mode is the right call for:
 - Any moment/range the user names explicitly ("around 2:30", "the intro", "the last 30 seconds").
@@ -107,7 +118,7 @@ Examples:
 # Last 10 seconds of a 1 minute video
 python3 "${CLAUDE_SKILL_DIR}/scripts/watch.py" video.mp4 --start 50 --end 60
 
-# Zoom into 2:15 → 2:45 at 3 fps (90 frames)
+# Zoom into 2:15 → 2:45 at 3 fps (enforce uniform sampling — disables scene-aware sampling)
 python3 "${CLAUDE_SKILL_DIR}/scripts/watch.py" "$URL" --start 2:15 --end 2:45 --fps 3
 
 # From 1h12m to the end of the video
@@ -146,7 +157,8 @@ Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are 
 ## Token efficiency
 
 This skill burns tokens primarily on frames. Order of magnitude:
-- 80 frames at 512px wide is roughly 50-80k image tokens depending on aspect ratio.
+- 80 frames at 512px wide is roughly 50-80k image tokens depending on aspect ratio. A 2hr+ video at the 180-frame ceiling pushes that toward ~150k.
+- Scene-aware sampling generally returns fewer frames than the per-duration ceiling (the ceiling kicks in mostly on dense, fast-cut content).
 - The transcript is cheap (a few thousand tokens at most for a 10-minute video).
 - Bumping `--resolution` to 1024 roughly quadruples the image tokens per frame. Only do it when necessary.
 
