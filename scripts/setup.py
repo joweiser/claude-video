@@ -27,6 +27,17 @@ import sys
 from pathlib import Path
 
 
+# Windows: Python defaults stdout/stderr to cp1252, which crashes on the
+# em-dashes this script emits in its dependency-missing hints. Reconfigure
+# to UTF-8 so downstream tools see what we intended.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+
 REQUIRED_BINARIES = ["ffmpeg", "ffprobe", "yt-dlp"]
 CONFIG_DIR = Path.home() / ".config" / "watch"
 CONFIG_FILE = CONFIG_DIR / ".env"

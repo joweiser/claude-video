@@ -21,6 +21,17 @@ from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 
 
+# Windows: Python defaults stdout/stderr to cp1252, which crashes on the
+# em-dashes and arrows this script emits in titles and report markdown.
+# Reconfigure to UTF-8 so downstream tools see what we intended.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="watch",
