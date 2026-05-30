@@ -75,9 +75,9 @@ def main() -> int:
     )
     ap.add_argument(
         "--whisper",
-        choices=["groq", "openai"],
+        choices=["elevenlabs", "groq", "openai"],
         default=None,
-        help="Force a specific Whisper backend. Default: prefer Groq, fall back to OpenAI.",
+        help="Force a specific transcription backend. Default: prefer ElevenLabs, then Groq, then OpenAI.",
     )
     ap.add_argument(
         "--json",
