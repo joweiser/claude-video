@@ -18,6 +18,11 @@ from pathlib import Path
 
 MAX_FPS = 2.0
 
+# Claude's Read tool rejects images whose width or height exceeds 2000px.
+# Keep below the actual ceiling so we're robust to off-by-one rounding inside
+# ffmpeg's scaler.
+READ_TOOL_MAX_EDGE = 1998
+
 # Scene-detect threshold for ffmpeg's `scene` metric. 0.3 = sensitive (catches
 # subtle changes), 0.4 = conservative (only obvious cuts). 0.35 is the
 # literature default; revisit if validation surfaces an obvious miscalibration.
@@ -189,6 +194,48 @@ def _parse_pts_from_stderr(stderr: str) -> list[float]:
     return [float(m.group(1)) for m in _SHOWINFO_PTS_RE.finditer(stderr)]
 
 
+def compute_target_dims(
+    src_w: int,
+    src_h: int,
+    requested_width: int,
+    max_edge: int = READ_TOOL_MAX_EDGE,
+) -> tuple[int, int, bool]:
+    """Pick output (width, height) so neither edge exceeds max_edge.
+
+    Preserves source aspect ratio. Returns (w, h, clamped) where clamped=True
+    means the requested width was reduced to keep the longer edge under
+    max_edge. Both dimensions are forced even (h264/libx264 require it).
+
+    Falls back to (requested_width, -2, False) when source dims are unknown —
+    -2 tells ffmpeg's scale filter to pick an even height matching aspect.
+    """
+    if src_w <= 0 or src_h <= 0 or requested_width <= 0:
+        return requested_width, -2, False
+
+    aspect = src_w / src_h
+    w = requested_width
+    h = int(round(w / aspect))
+
+    if w % 2:
+        w -= 1
+    if h % 2:
+        h -= 1
+
+    clamped = False
+    longest = max(w, h)
+    if longest > max_edge:
+        scale = max_edge / longest
+        w = int(w * scale)
+        h = int(h * scale)
+        if w % 2:
+            w -= 1
+        if h % 2:
+            h -= 1
+        clamped = True
+
+    return max(2, w), max(2, h), clamped
+
+
 def extract(
     video_path: str,
     out_dir: Path,
@@ -197,7 +244,7 @@ def extract(
     fps: float | None = None,
     scene_threshold: float = SCENE_THRESHOLD,
     temporal_floor: float = 30.0,
-    resolution: int = 512,
+    resolution: int = 1024,
     max_frames: int = 100,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
@@ -220,6 +267,24 @@ def extract(
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
 
+    try:
+        meta = get_metadata(video_path)
+        src_w = meta.get("width") or 0
+        src_h = meta.get("height") or 0
+    except SystemExit:
+        src_w, src_h = 0, 0
+
+    target_w, target_h, clamped = compute_target_dims(src_w, src_h, resolution)
+
+    if clamped:
+        natural_h = int(round(resolution / (src_w / src_h))) if src_w and src_h else 0
+        print(
+            f"[watch] source {src_w}x{src_h} at requested width {resolution} would have "
+            f"produced {resolution}x{natural_h} (Claude's Read tool rejects any edge "
+            f">{READ_TOOL_MAX_EDGE}px). Clamped to {target_w}x{target_h}.",
+            file=sys.stderr,
+        )
+
     out_dir.mkdir(parents=True, exist_ok=True)
     for existing in out_dir.glob("frame_*.jpg"):
         existing.unlink()
@@ -240,6 +305,11 @@ def extract(
     if end_seconds is not None:
         cmd += ["-to", f"{end_seconds:.3f}"]
 
+    scale_expr = (
+        f"scale={target_w}:{target_h}" if target_h > 0
+        else f"scale={target_w}:-2"
+    )
+
     if mode == "scene":
         # `+` = logical OR in ffmpeg's select expression. Commas inside gt()/gte()
         # are escaped so they aren't parsed as filter-chain separators. eq(n,0)
@@ -249,9 +319,9 @@ def extract(
             f"+gte(t-prev_selected_t\\,{temporal_floor})"
             f"+eq(n\\,0)"
         )
-        vf = f"select={select_expr},showinfo,scale={resolution}:-2"
+        vf = f"select={select_expr},showinfo,{scale_expr}"
     else:
-        vf = f"fps={fps},showinfo,scale={resolution}:-2"
+        vf = f"fps={fps},showinfo,{scale_expr}"
 
     cmd += [
         "-i", str(Path(video_path).resolve()),
@@ -305,7 +375,7 @@ if __name__ == "__main__":
     args = sys.argv[3:]
 
     fps_override = None
-    resolution = 512
+    resolution = 1024
     max_frames_cli = None  # None = take from scene_budget table
     start_arg = None
     end_arg = None
