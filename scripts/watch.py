@@ -7,6 +7,7 @@ then Reads each frame path to see the video.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -15,7 +16,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from download import download, is_url  # noqa: E402
+from download import DEFAULT_SUB_LANGS, download, is_url  # noqa: E402
 from frames import (  # noqa: E402
     MAX_FPS,
     SCENE_THRESHOLD,
@@ -41,6 +42,42 @@ for _stream in (sys.stdout, sys.stderr):
             pass
 
 
+TRANSCRIPT_HEAD_LINES = 30
+TRANSCRIPT_TAIL_LINES = 10
+
+
+def _write_transcript_files(
+    work: Path,
+    segments: list[dict],
+    transcript_source: str,
+    transcript_text: str,
+) -> tuple[Path, Path]:
+    """Write transcript.json (machine-readable) and transcript.md (human) to the work dir."""
+    transcript_json = work / "transcript.json"
+    transcript_md = work / "transcript.md"
+    transcript_json.write_text(
+        json.dumps({"source": transcript_source, "segments": segments}, indent=2),
+        encoding="utf-8",
+    )
+    transcript_md.write_text(transcript_text + "\n", encoding="utf-8")
+    return transcript_json, transcript_md
+
+
+def _abbreviated_transcript(segments: list[dict]) -> str:
+    """First TRANSCRIPT_HEAD_LINES + last TRANSCRIPT_TAIL_LINES segments for the preview."""
+    total = len(segments)
+    if total <= TRANSCRIPT_HEAD_LINES + TRANSCRIPT_TAIL_LINES + 5:
+        return format_transcript(segments)
+    head = format_transcript(segments[:TRANSCRIPT_HEAD_LINES])
+    tail = format_transcript(segments[-TRANSCRIPT_TAIL_LINES:])
+    omitted = total - TRANSCRIPT_HEAD_LINES - TRANSCRIPT_TAIL_LINES
+    return (
+        f"{head}\n"
+        f"... [{omitted} segments omitted — read transcript.md for full text] ...\n"
+        f"{tail}"
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="watch",
@@ -53,7 +90,7 @@ def main() -> int:
         default=None,
         help="Cap on frame count (default: per-duration table, up to 180 on >2hr videos)",
     )
-    ap.add_argument("--resolution", type=int, default=512, help="Frame width in pixels (default 512)")
+    ap.add_argument("--resolution", type=int, default=1024, help="Frame width in pixels (default 1024)")
     ap.add_argument(
         "--fps",
         type=float,
@@ -84,6 +121,13 @@ def main() -> int:
         action="store_true",
         help="Emit the full report as one JSON object on stdout instead of markdown.",
     )
+    ap.add_argument(
+        "--sub-lang",
+        type=str,
+        default=None,
+        help="Comma-separated subtitle languages to fetch (e.g. 'ko' or 'ja,en'). "
+        "Default: English variants. Lets non-English videos use free captions instead of Whisper.",
+    )
     args = ap.parse_args()
 
     if args.out_dir:
@@ -97,7 +141,7 @@ def main() -> int:
         "[watch] downloading via yt-dlp…" if is_url(args.source) else "[watch] using local file…",
         file=sys.stderr,
     )
-    dl = download(args.source, work / "download")
+    dl = download(args.source, work / "download", sub_langs=args.sub_lang or DEFAULT_SUB_LANGS)
     video_path = dl["video_path"]
 
     meta = get_metadata(video_path)
@@ -213,10 +257,15 @@ def main() -> int:
                 file=sys.stderr,
             )
 
+    transcript_md_path: Path | None = None
+    if transcript_segments and transcript_text is not None and transcript_source is not None:
+        _, transcript_md_path = _write_transcript_files(
+            work, transcript_segments, transcript_source, transcript_text,
+        )
+
     info = dl.get("info") or {}
 
     if args.json:
-        import json
         long_unfocused = not focused and full_duration > 600
         report = {
             "schema_version": "1.0.0",
@@ -321,6 +370,8 @@ def main() -> int:
             f"- **Transcript:** {len(transcript_segments)} segments{in_range} "
             f"(via {transcript_source or 'captions'})"
         )
+        if transcript_md_path is not None:
+            print(f"- **Transcript file:** `{transcript_md_path}`")
     else:
         print("- **Transcript:** none available")
 
@@ -352,15 +403,20 @@ def main() -> int:
     print()
     print("## Transcript")
     print()
-    if transcript_text:
+    if transcript_text and transcript_segments:
         label = transcript_source or "captions"
-        if focused:
-            print(f"_Source: {label}. Filtered to {format_time(effective_start)} → {format_time(effective_end)}:_")
-        else:
-            print(f"_Source: {label}._")
+        scope_note = (
+            f"Filtered to {format_time(effective_start)} → {format_time(effective_end)}. "
+            if focused else ""
+        )
+        md_ref = f"`{transcript_md_path}`" if transcript_md_path else "transcript.md"
+        print(
+            f"_Source: {label}. {scope_note}{len(transcript_segments)} segments — "
+            f"full text in_ {md_ref}_, preview below:_"
+        )
         print()
         print("```")
-        print(transcript_text)
+        print(_abbreviated_transcript(transcript_segments))
         print("```")
     elif focused and dl.get("subtitle_path"):
         print(f"_No transcript lines fell inside {format_time(effective_start)} → {format_time(effective_end)}._")
