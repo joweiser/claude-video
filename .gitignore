@@ -9,8 +9,8 @@ htmlcov/
 .idea/
 .vscode/
 
-# build artifact from scripts/build-skill.sh
-/dist/
-
 # local Claude Code settings
 .claude/settings.local.json
+
+# local planning / working notes
+ROADMAP.md
