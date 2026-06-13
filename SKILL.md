@@ -86,11 +86,12 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/watch.py" "<source>"
 Optional flags:
 - `--start T` / `--end T` — focus on a section. Accepts `SS`, `MM:SS`, or `HH:MM:SS`. When either is set, sampling is denser and the minimum gap shrinks (see "Focusing on a section" below).
 - `--max-frames N` — lower the cap for tighter token budget (e.g. `--max-frames 40`). Defaults to the per-duration table above.
-- `--resolution W` — change frame width in px (default 512; bump to 1024 only if the user needs to read on-screen text)
+- `--resolution W` — change frame width in px (default 1024; bump toward 1456 for dense code/text, or lower to ~768 for a tighter token budget). The API downsamples beyond ~1568 px, so higher values mostly waste tokens. Auto-clamped so no edge exceeds 1998 px (Read tool's per-dim limit) — portrait phone recordings are sized down automatically.
 - `--fps F` — enforce uniform sampling (clamped to 2 fps). Disables scene-aware mode.
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
 - `--whisper groq|openai` — force a specific Whisper backend (default: prefer Groq if both keys exist)
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
+- `--sub-lang LANGS` — comma-separated subtitle languages to fetch (e.g. `ko`, `ja,en`). Default: English variants. Use for non-English videos so they pull free captions instead of falling back to Whisper.
 - `--no-frames` — skip frame extraction entirely. Use for audio-only content (podcasts, interviews, lectures) where frames waste tokens. Transcript-only output.
 - `--json` — emit the full report as one JSON object on stdout instead of markdown (see "Structured output" below)
 
@@ -106,7 +107,7 @@ Example (truncated):
   "source": { "kind": "url", "raw": "https://youtu.be/abc", "title": "...", "uploader": "...", "url": "...", "subtitle_path": null },
   "video": { "path": "/tmp/watch-xyz/download/video.mp4", "duration_seconds": 123.4, "width": 1920, "height": 1080, "codec": "h264", "size_bytes": 12345678, "has_audio": true },
   "focus": { "applied": false, "start_seconds": null, "end_seconds": null, "duration_seconds": null },
-  "frames": { "count": 80, "fps": 0.65, "target": 80, "max_frames": 80, "resolution_px": 512, "mode": "full", "items": [{ "index": 0, "timestamp_seconds": 0.0, "path": "/tmp/watch-xyz/frames/frame_0000.jpg" }] },
+  "frames": { "count": 80, "fps": 0.65, "target": 80, "max_frames": 80, "resolution_px": 1024, "mode": "full", "items": [{ "index": 0, "timestamp_seconds": 0.0, "path": "/tmp/watch-xyz/frames/frame_0000.jpg" }] },
   "transcript": { "source": "captions", "filtered_to_focus": false, "segments": [{ "start_seconds": 0.0, "end_seconds": 3.2, "text": "Welcome" }] },
   "warnings": [],
   "work_dir": "/tmp/watch-xyz"
@@ -169,7 +170,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/watch.py" "$URL" --start 1:12:00
 
 **Step 4 — answer the user.** You now have two streams of evidence:
 - **Frames** — what's on screen at each timestamp
-- **Transcript** — what's said at each timestamp. The report's header shows the source (`captions` = yt-dlp pulled native subs; `whisper (groq)` or `whisper (openai)` = transcribed by API).
+- **Transcript** — what's said at each timestamp. The report header shows the source (`captions` = yt-dlp pulled native subs; `whisper (groq)` / `whisper (openai)` / `whisper (elevenlabs)` = transcribed by API). The report shows a head/tail preview; the full transcript is in `transcript.md` in the working directory — Read it when you need the complete text.
 
 If the user asked a specific question, answer it directly citing timestamps. If they didn't ask anything, summarize what happens in the video — structure, key moments, notable visuals, spoken content.
 
@@ -198,10 +199,10 @@ Keys live in `~/.config/watch/.env`. Order of preference: ElevenLabs → Groq �
 ## Token efficiency
 
 This skill burns tokens primarily on frames. Order of magnitude:
-- 80 frames at 512px wide is roughly 50-80k image tokens depending on aspect ratio. A 2hr+ video at the 180-frame ceiling pushes that toward ~150k.
+- 80 frames at the 1024px-wide default is roughly 200-320k image tokens depending on aspect ratio. A 2hr+ video at the 180-frame ceiling pushes that toward ~700k.
 - Scene-aware sampling generally returns fewer frames than the per-duration ceiling (the ceiling kicks in mostly on dense, fast-cut content).
 - The transcript is cheap (a few thousand tokens at most for a 10-minute video).
-- Bumping `--resolution` to 1024 roughly quadruples the image tokens per frame. Only do it when necessary.
+- Image tokens scale with pixel area: dropping to `--resolution 768` roughly halves tokens/frame, and `512` quarters them — lower it on long videos or when on-screen text doesn't matter. Bumping toward 1456 adds cost up to the API's ~1568px downscale ceiling, past which it's wasted.
 
 If you already watched a video this session and the user asks a follow-up, do **not** re-run the script — you already have the frames and transcript in context. Just answer from what you have.
 
